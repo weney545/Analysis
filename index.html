@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Posture Analytics Dashboard</title>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin: 0; padding-top: 20px; background-color: #f4f4f9; }
+        h2 { color: #333; margin-bottom: 20px; }
+        #period-buttons { margin-bottom: 20px; }
+        #period-buttons button {
+            padding: 8px 15px;
+            margin: 0 5px;
+            border: 1px solid #ccc;
+            background-color: #fff;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background-color 0.2s;
+        }
+        #period-buttons button.active {
+            background-color: #007bff;
+            color: white;
+            border-color: #007bff;
+        }
+        #risk-display { margin-bottom: 25px; font-size: 1.2em; font-weight: bold; }
+        #risk-score-label { padding: 5px 10px; border-radius: 4px; color: white; }
+        #chart-container {
+            width: 90%;
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            min-height: 350px;
+        }
+    </style>
+</head>
+<body>
+    
+    <h2>Historical Posture Risk Analysis</h2>
+
+    <div id="period-buttons">
+        <button id="btn-day" data-period="day">Day</button>
+        <button id="btn-week" data-period="week">Week</button>
+        <button id="btn-month" data-period="month">Month</button>
+        <button id="btn-year" data-period="year">Year</button>
+    </div>
+
+    <div id="risk-display">
+        Overall Risk: <span id="risk-score-label">--</span>
+    </div>
+
+    <div id="chart-container">
+        <canvas id="postureChart"></canvas>
+    </div>
+
+    <script>
+        // --- 1. FIREBASE CONFIGURATION (Using your uploaded google-services.json) ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyDaNr2RhRBajo9zUBiFkMUzh8_6mulz_a4",
+            authDomain: "checkers-offline-arena.firebaseapp.com",
+            databaseURL: "https://checkers-offline-arena-default-rtdb.firebaseio.com/",
+            projectId: "checkers-offline-arena",
+            storageBucket: "checkers-offline-arena.firebasestorage.app",
+            messagingSenderId: "923693932663"
+        };
+
+        // Initialize Firebase App
+        firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+        
+        // --- 2. GLOBAL VARIABLES AND UTILITIES ---
+        let postureChartInstance;
+        let rawAlertsData = null; 
+
+        function getUrlParameter(name) {
+            name = name.replace(/[\[]/, '\\[').replace(/[\]]/, '\\]');
+            const regex = new RegExp('[\\?&]' + name + '=([^&#]*)');
+            const results = regex.exec(location.search);
+            return results === null ? '' : decodeURIComponent(results[1].replace(/\+/g, ' '));
+        }
+
+        // --- 3. DATA FETCHING (UPDATED TO PARSE COMPLEX TIMESTAMPS) ---
+
+        /**
+         * Fetches data from Firebase and processes the complex value string
+         * to extract a parsable date object.
+         * @param {string} userId - The ID passed from App Inventor.
+         */
+        async function fetchDataFromFirebase(userId) {
+            // Path derived from your Firebase structure screenshot
+            const dataPath = `/private/data/alerts/${userId}/posture_events/11/23`; 
+            
+            try {
+                const snapshot = await database.ref(dataPath).once('value');
+                const alerts = snapshot.val();
+                
+                if (!alerts) return [];
+                
+                let processedData = [];
+                
+                Object.entries(alerts).forEach(([key, valueString]) => {
+                    // ValueString is a stringified list: "[3.9..., -5.0..., '11/23/2025 10:12:21 PM']"
+                    // 1. Extract the full timestamp string from the end of the list
+                    const match = valueString.match(/'([^']+)'/);
+                    const fullTimestamp = match ? match[1] : null;
+
+                    if (fullTimestamp) {
+                        // 2. Parse the full timestamp string: "11/23/2025 10:12:21 PM"
+                        const date = new Date(fullTimestamp);
+                        
+                        // 3. Assume a severity count of 1 for each entry for charting
+                        processedData.push({ 
+                            date: date, 
+                            count: 1
+                        });
+                    }
+                });
+                
+                // Sort by date to ensure charts are sequential
+                return processedData.sort((a, b) => a.date.getTime() - b.date.getTime());
+
+            } catch (error) {
+                console.error("Firebase data load failed:", error);
+                document.getElementById('risk-score-label').textContent = 'Error loading data.';
+                return [];
+            }
+        }
+
+        // --- 4. DATA PROCESSING (IMPLEMENTED GROUPING LOGIC) ---
+
+        /**
+         * Groups the raw alert data by the selected period and calculates risk.
+         * This replaces the App Inventor's Better1.ProcessAlerts logic.
+         */
+        function groupDataByPeriod(data, period) {
+            if (!data || data.length === 0) return { labels: ['No Data'], dataPoints: [0], risk: 0 };
+
+            // Function to generate the grouping key based on the period
+            const formatters = {
+                'day': (date) => date.getHours() + ':00',  // Group by hour
+                'week': (date) => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][date.getDay()], // Group by day of week
+                'month': (date) => `Wk ${Math.ceil(date.getDate() / 7)}`, // Group by week of month
+                'year': (date) => ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][date.getMonth()] // Group by month
+            };
+
+            const groupingMap = new Map();
+            let totalAlerts = 0;
+
+            // Grouping the data
+            data.forEach(alert => {
+                const key = formatters[period](alert.date);
+                const currentCount = groupingMap.get(key) || 0;
+                groupingMap.set(key, currentCount + alert.count);
+                totalAlerts += alert.count;
+            });
+
+            // Determine final labels and data points
+            let labels = Array.from(groupingMap.keys());
+            let dataPoints = Array.from(groupingMap.values());
+            
+            // --- Risk Calculation (Adjust this threshold for your app) ---
+            const HIGH_RISK_THRESHOLD = 500; // Total alerts that signifies 100% risk across all fetched data
+            const riskScore = Math.min(100, Math.floor((totalAlerts / HIGH_RISK_THRESHOLD) * 100));
+
+            return { labels, dataPoints, risk: riskScore };
+        }
+
+        // --- 5. UI AND CHART RENDERING ---
+
+        function getRiskStatus(score) {
+            if (score < 35) return { status: "Good", color: 'rgb(40, 167, 69)' };
+            if (score < 75) return { status: "Warning", color: 'rgb(255, 193, 7)' };
+            return { status: "High Risk", color: 'rgb(220, 53, 69)' };
+        }
+
+        function updateRiskDisplay(score) {
+            const { status, color } = getRiskStatus(score);
+            const label = document.getElementById('risk-score-label');
+            label.textContent = `${score.toFixed(0)}% (${status})`;
+            label.style.backgroundColor = color;
+        }
+
+        function drawChart(labels, dataPoints, period) {
+            const ctx = document.getElementById('postureChart').getContext('2d');
+            
+            if (postureChartInstance) {
+                postureChartInstance.destroy();
+            }
+
+            postureChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: `Total Alerts per ${period}`,
+                        data: dataPoints,
+                        borderColor: 'rgb(0, 123, 255)',
+                        backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                        fill: true,
+                        tension: 0.3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Alert Count' }
+                        }
+                    },
+                    plugins: {
+                        title: { display: true, text: `Posture Alert Trend by ${period.toUpperCase()}` }
+                    }
+                }
+            });
+        }
+
+        // --- 6. MAIN INITIALIZATION AND EVENT HANDLERS ---
+        
+        function updateChart(period) {
+            if (!rawAlertsData) {
+                document.getElementById('risk-score-label').textContent = 'Loading...';
+                return;
+            }
+            const { labels, dataPoints, risk } = groupDataByPeriod(rawAlertsData, period);
+            updateRiskDisplay(risk);
+            drawChart(labels, dataPoints, period);
+        }
+
+        function setupPeriodButtons() {
+            const buttons = document.querySelectorAll('#period-buttons button');
+            
+            buttons.forEach(button => {
+                button.addEventListener('click', (event) => {
+                    const period = event.target.getAttribute('data-period');
+                    
+                    // Highlight the active button
+                    buttons.forEach(b => b.classList.remove('active'));
+                    event.target.classList.add('active');
+                    
+                    updateChart(period);
+                });
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const USER_ID = getUrlParameter('user');
+            
+            if (USER_ID) {
+                document.getElementById('risk-score-label').textContent = 'Fetching Data...';
+                
+                // 1. Initial Data Fetch (Async)
+                rawAlertsData = await fetchDataFromFirebase(USER_ID);
+                
+                // 2. Set up button handlers
+                setupPeriodButtons();
+                
+                // 3. Load default view (Day)
+                const defaultPeriod = 'day';
+                const defaultButton = document.querySelector(`#btn-${defaultPeriod}`);
+                if (defaultButton) defaultButton.classList.add('active');
+
+                updateChart(defaultPeriod);
+            } else {
+                document.getElementById('risk-score-label').textContent = 'Error: No User ID found in URL.';
+            }
+        });
+    </script>
+</body>
+</html>
